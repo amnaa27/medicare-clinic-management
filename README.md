@@ -1,14 +1,19 @@
-# TechXpress - E-commerce
+# MediCare - Clinic Management & Appointment System
 
-TechXpress is a full-featured e-commerce platform to browse electronics (laptops, mobiles, cameras), manage carts, and complete purchases via integrated payment gateways. It includes an admin panel for managing products, categories, and orders. 
+MediCare is a comprehensive healthcare platform built with **ASP.NET Core MVC** and **N-Tier Architecture** to streamline clinic management, doctor schedules, and patient appointments.
+
+---
 
 ## Architecture
-Following the **N-Tier architecture** (UI, Business Logic, and Data Access) to ensure maintainability and scalability.
+The system follows **N-Tier Architecture** for clean separation of concerns:
+- **`MediCare.Web`**: Presentation Layer (ASP.NET Core MVC)
+- **`MediCare.Services`**: Business Logic Layer
+- **`MediCare.Data`**: Data Access Layer (Entity Framework Core)
 
-## Technologies Used
-* **Framework:** ASP.NET Core MVC
-* **Database / ORM:** Entity Framework Core
-* **Authentication:** ASP.NET Identity
-* **Payment Integration:** Stripe
-* **Frontend Tools:** jQuery, DataTables, Toastr JS
-* **Cloud / Deployment:** Microsoft Azure
+---
+
+## Key Technologies & Patterns
+- **Framework:** ASP.NET Core MVC
+- **ORM & DB:** Entity Framework Core & SQL Server
+- **Security:** ASP.NET Core Identity (Roles: Admin, Doctor, Patient)
+- **Design Patterns:** Repository Pattern, Unit of Work, Dependency Injection
