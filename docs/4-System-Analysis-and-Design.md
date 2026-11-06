@@ -39,9 +39,11 @@ flowchart LR
         UC11["Create medical record"]
         UC12["Issue prescription"]
         UC13["Approve doctor registration"]
-        UC14["Manage users, doctors and specializations"]
+        UC14["Manage users, doctors, specializations and clinic settings"]
         UC15["View analytics and export reports"]
         UC16["Send appointment reminders"]
+        UC17["View schedule and patient history"]
+        UC18["View and manage all appointments"]
     end
 
     Patient --- UC1
@@ -57,10 +59,12 @@ flowchart LR
     Doctor --- UC10
     Doctor --- UC11
     Doctor --- UC12
+    Doctor --- UC17
     Admin --- UC1
     Admin --- UC13
     Admin --- UC14
     Admin --- UC15
+    Admin --- UC18
     UC16 --- Sms
     UC16 --- Mail
 ```
@@ -78,11 +82,12 @@ flowchart TB
     subgraph Web ["Presentation Layer (MediCare.Web)"]
         Ctrl["Controllers"]
         View["Razor Views and ViewModels"]
-        Hub["SignalR Hub"]
+        Hub["SignalR Hub (implements INotificationSender)"]
     end
 
     subgraph BLL ["Business Logic Layer (MediCare.Services)"]
         Svc["Services: Auth, Appointments, Schedules, Records, Prescriptions, Notifications, Reports"]
+        Iface["INotificationSender (interface)"]
     end
 
     subgraph DAL ["Data Access Layer (MediCare.Data)"]
@@ -97,7 +102,8 @@ flowchart TB
     Ctrl --> View
     View --> User
     Ctrl --> Svc
-    Svc --> Hub
+    Svc --> Iface
+    Hub -.->|implements| Iface
     Hub --> User
     Svc --> Repo
     Repo --> Ctx
@@ -106,6 +112,8 @@ flowchart TB
 ```
 
 **Patterns used:** Repository, Unit of Work, Factory (appointment and notification types) and Dependency Injection.
+
+**Layering rule:** `MediCare.Services` never references `MediCare.Web`. Real-time notifications go through the `INotificationSender` interface defined in Services, and the SignalR Hub in Web implements it (Dependency Injection).
 
 ---
 
@@ -134,7 +142,6 @@ erDiagram
         string Email
         string FullName
         string PhoneNumber
-        string Role
         bool IsActive
     }
     Specialization {
@@ -182,8 +189,10 @@ erDiagram
         date AppointmentDate
         time StartTime
         time EndTime
+        decimal Fee
         string Status
         string Notes
+        datetime ReminderSentAt
         byte RowVersion
     }
     MedicalRecord {
@@ -219,7 +228,9 @@ erDiagram
     Notification {
         int Id PK
         string UserId FK
-        string Type
+        int AppointmentId FK
+        string Channel
+        string Status
         string Message
         bool IsRead
         datetime CreatedAt
@@ -228,20 +239,20 @@ erDiagram
 
 ## 2.2 Logical Schema
 
-Primary keys are underlined with `PK`, foreign keys are written as `FK -> Table`.
+`PK` marks a primary key and `FK -> Table` marks a foreign key.
 
-- **ApplicationUser**(Id PK, Email, FullName, PhoneNumber, Role, IsActive)
+- **ApplicationUser**(Id PK, Email, FullName, PhoneNumber, IsActive). Roles (Patient, Doctor, Admin) are stored in the standard ASP.NET Identity role tables.
 - **Specialization**(Id PK, Name)
 - **Doctor**(Id PK, UserId FK -> ApplicationUser, SpecializationId FK -> Specialization, Location, ConsultationFee, ProfileImage, IsApproved)
 - **Patient**(Id PK, UserId FK -> ApplicationUser, DateOfBirth, Gender, MedicalHistory, Allergies, SmsEnabled, EmailEnabled)
 - **WorkingHour**(Id PK, DoctorId FK -> Doctor, DayOfWeek, StartTime, EndTime, SlotMinutes)
 - **VacationDay**(Id PK, DoctorId FK -> Doctor, StartDate, EndDate, Reason)
-- **Appointment**(Id PK, DoctorId FK -> Doctor, PatientId FK -> Patient, AppointmentDate, StartTime, EndTime, Status, Notes, RowVersion)
+- **Appointment**(Id PK, DoctorId FK -> Doctor, PatientId FK -> Patient, AppointmentDate, StartTime, EndTime, Fee, Status, Notes, ReminderSentAt, RowVersion)
 - **MedicalRecord**(Id PK, PatientId FK -> Patient, AppointmentId FK -> Appointment, Symptoms, Diagnosis, TreatmentNotes, CreatedAt)
 - **MedicalDocument**(Id PK, MedicalRecordId FK -> MedicalRecord, FileName, FilePath, DocumentType)
 - **Prescription**(Id PK, MedicalRecordId FK -> MedicalRecord, IssuedAt, Notes)
 - **PrescriptionItem**(Id PK, PrescriptionId FK -> Prescription, MedicationName, Dosage, Frequency, Duration)
-- **Notification**(Id PK, UserId FK -> ApplicationUser, Type, Message, IsRead, CreatedAt)
+- **Notification**(Id PK, UserId FK -> ApplicationUser, AppointmentId FK -> Appointment (optional), Channel, Status, Message, IsRead, CreatedAt)
 
 ## 2.3 Physical Schema (SQL Server)
 
@@ -255,18 +266,23 @@ CREATE TABLE Appointment (
     AppointmentDate DATE          NOT NULL,
     StartTime       TIME          NOT NULL,
     EndTime         TIME          NOT NULL,
+    Fee             DECIMAL(10,2) NOT NULL,
     Status          NVARCHAR(20)  NOT NULL DEFAULT 'Pending',
     Notes           NVARCHAR(500) NULL,
+    ReminderSentAt  DATETIME2     NULL,
     RowVersion      ROWVERSION
 );
 
--- Blocks double-booking of the same doctor and time (cancelled appointments are ignored)
+-- Blocks two active appointments with the same doctor and start time (cancelled ones are ignored)
 CREATE UNIQUE INDEX UX_Appointment_Doctor_Slot
     ON Appointment (DoctorId, AppointmentDate, StartTime)
     WHERE Status <> 'Cancelled';
 ```
 
 Other physical decisions:
+- **Overlap check:** the unique index only catches identical start times, so the booking service also checks that the new slot does not overlap an existing appointment (for example, if the slot length changes).
+- **Fee:** the consultation fee is copied into `Appointment.Fee` at booking time, so revenue reports stay correct even if the doctor changes the fee later.
+- **Reminders:** `ReminderSentAt` stops the scheduler from sending the same reminder twice.
 - Primary keys are `INT IDENTITY`, except `ApplicationUser.Id`, which is a string (ASP.NET Identity).
 - Foreign keys have indexes (`DoctorId`, `PatientId`, `UserId`, `SpecializationId`) to keep queries fast.
 - Text fields use `NVARCHAR` so Arabic and English data are both supported.
@@ -278,7 +294,7 @@ The schema is in **Third Normal Form (3NF)**:
 - Each column holds one value (for example, medications are in `PrescriptionItem`, not in a text list inside `Prescription`).
 - Doctor specializations are stored once in `Specialization` and referenced by key.
 - Working hours and vacation days are separate tables because a doctor has many of them.
-- No column depends on another non-key column.
+- No column depends on another non-key column, with one deliberate exception: `MedicalRecord.PatientId` can also be found through `Appointment`. It is kept so a patient's history can be loaded without a join, and the service must make sure it matches `Appointment.PatientId`. The team can remove it if a strict 3NF is preferred.
 
 ---
 
@@ -604,6 +620,7 @@ classDiagram
         +date AppointmentDate
         +time StartTime
         +time EndTime
+        +decimal Fee
         +string Status
     }
     class MedicalRecord {
@@ -669,9 +686,65 @@ classDiagram
 
 ## 4.1 Wireframes & Mockups
 
-Five main screens are designed: login, doctor search, appointment booking, doctor dashboard and admin dashboard. The design file is here (the link is private to the project owner's account, so add screenshots of the five screens to `docs/images/` before submitting):
+The interface has 12 screens that cover the three roles. The screens are also built as a working prototype (a single-page website with sample data).
 
-`https://claude.ai/artifact/PTiAgsC4CjzprMagR8Di3X`
+### Public screens
+
+**Login (patient or doctor)**
+
+![Login (patient or doctor)](images/01-login.png)
+
+**Patient registration**
+
+![Patient registration](images/02-register.png)
+
+### Patient screens
+
+**Doctor search with filters**
+
+![Doctor search with filters](images/03-doctors.png)
+
+**Appointment booking with free and booked slots**
+
+![Appointment booking with free and booked slots](images/04-booking.png)
+
+**My appointments: upcoming and history**
+
+![My appointments: upcoming and history](images/05-appointments.png)
+
+**Medical records and prescriptions**
+
+![Medical records and prescriptions](images/06-records.png)
+
+**Profile and notification preferences**
+
+![Profile and notification preferences](images/07-profile.png)
+
+### Doctor screens
+
+**Doctor dashboard: confirm or reject requests**
+
+![Doctor dashboard: confirm or reject requests](images/08-d-dashboard.png)
+
+**Working hours and vacation days**
+
+![Working hours and vacation days](images/09-schedule.png)
+
+**Medical record and prescription**
+
+![Medical record and prescription](images/10-write-record.png)
+
+### Admin screens
+
+**Admin dashboard: statistics, chart and doctor approvals**
+
+![Admin dashboard: statistics, chart and doctor approvals](images/11-a-dashboard.png)
+
+**Manage doctors**
+
+![Manage doctors](images/12-a-doctors.png)
+
+---
 
 ## 4.2 UI/UX Guidelines
 
@@ -752,7 +825,8 @@ flowchart TB
     Ctrl --> Rec
     Ctrl --> Rep
     Appt --> Notif
-    Notif --> Hub
+    Notif --> INotif["INotificationSender"]
+    Hub -.->|implements| INotif
     Auth --> UoW
     Appt --> UoW
     Sched --> UoW
